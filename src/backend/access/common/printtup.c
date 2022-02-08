@@ -178,6 +178,7 @@ typedef struct {
     void **context;
     void **contextLength;
     size_t data_sent;
+    int compression_level;
 } ResultSetBuffer;
 
 static bool initialized = false;
@@ -190,7 +191,6 @@ static long beginTime = 0;
 
 //#define PROTOCOL_NULLMASK
 #define USE_ZSTD
-static int COMPRESSION_LEVEL = -5;
 
 /**
  * Returns the current time in microseconds.
@@ -226,6 +226,12 @@ SendRowDescriptionMessage(StringInfo buf, TupleDesc typeinfo,
     ereport(LOG, (errmsg("Setting Begin Time: %ld", beginTime)));
 
     if (!initialized) {
+        char *clevel;
+        if (clevel = getenv("COMPRESSION_LEVEL")) {
+            rsbuf.compression_level = atoi(clevel);
+        } else {
+            rsbuf.compression_level = 0;
+        }
         rsbuf.maxsize = CHUNK_SIZE;
         rsbuf.buffer = malloc(CHUNK_SIZE);
         rsbuf.copy_buffer = malloc(CHUNK_SIZE);
@@ -524,13 +530,13 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 
 
             if (!rsbuf.dict[i]) {
-                rsbuf.dict[i] = ZSTD_createCDict(data_start, len, COMPRESSION_LEVEL);
-                rsbuf.dictLength[i] = ZSTD_createCDict(length_start, rsbuf.count * sizeof (int), COMPRESSION_LEVEL);
+                rsbuf.dict[i] = ZSTD_createCDict(data_start, len, rsbuf.compression_level);
+                rsbuf.dictLength[i] = ZSTD_createCDict(length_start, rsbuf.count * sizeof (int), rsbuf.compression_level);
                 rsbuf.context[i] = ZSTD_createCCtx();
                 rsbuf.contextLength[i] = ZSTD_createCCtx();
-                compressed_length_data = ZSTD_compress(rsbuf.compression_buffer, MAX_COMPRESSED_LENGTH, data_start, len, COMPRESSION_LEVEL);
-                compressed_length_lengths = ZSTD_compress(rsbuf.compression_buffer + compressed_length_data, MAX_COMPRESSED_LENGTH, length_start, rsbuf.count * sizeof (int), COMPRESSION_LEVEL);
-                ereport(LOG, (errmsg("Created dicts: %ld", getMicrotime() - beginTime)));
+                compressed_length_data = ZSTD_compress(rsbuf.compression_buffer, MAX_COMPRESSED_LENGTH, data_start, len, rsbuf.compression_level);
+                compressed_length_lengths = ZSTD_compress(rsbuf.compression_buffer + compressed_length_data, MAX_COMPRESSED_LENGTH, length_start, rsbuf.count * sizeof (int), rsbuf.compression_level);
+                // ereport(LOG, (errmsg("Created dicts: %ld", getMicrotime() - beginTime)));
             } else {
                 compressed_length_data = ZSTD_compress_usingCDict(rsbuf.context[i], rsbuf.compression_buffer, MAX_COMPRESSED_LENGTH, data_start, len, rsbuf.dict[i]);
                 compressed_length_lengths = ZSTD_compress_usingCDict(rsbuf.contextLength[i], rsbuf.compression_buffer + compressed_length_data, MAX_COMPRESSED_LENGTH, length_start, rsbuf.count * sizeof (int), rsbuf.dictLength[i]);
