@@ -31,6 +31,9 @@
 #include "mb/pg_wchar.h"
 #include "port/pg_bswap.h"
 
+#include <snappy-c.h>
+#include <zstd.h>
+
 /*
  * This macro lists the backend message types that could be "long" (more
  * than a couple of kilobytes).
@@ -52,6 +55,26 @@ static void reportErrorPosition(PQExpBuffer msg, const char *query,
 								int loc, int encoding);
 static int	build_startup_packet(const PGconn *conn, char *packet,
 								 const PQEnvironmentOption *options);
+
+typedef struct  {
+    int natts;
+    int *typelengths;
+    int *types;
+    bool *data_not_null;
+    int32 nullmask_size;
+    char *result_buffer;
+    void **dict;
+    void **dictLength;
+    void **context;
+    void **contextLength;
+} ResultSetInformation;
+
+static ResultSetInformation rsinfo;
+
+static int16 USE_COMPRESSION = false;
+static int32 CHUNK_SIZE = 10000000; // 1 Mb chunks
+
+#define USE_ZSTD
 
 
 /*
@@ -545,6 +568,18 @@ getRowDescriptions(PGconn *conn, int msgLength)
 	}
 	nfields = result->numAttributes;
 
+    if (pqGetInt(&USE_COMPRESSION, 2, conn)) {
+        printf("Error getting use compression");
+        errmsg = libpq_gettext("Error getting use compression");
+        goto advance_and_error;
+    }
+
+    if (pqGetInt(&CHUNK_SIZE, 4, conn)) {
+        printf("Error getting chunk size");
+        errmsg = libpq_gettext("Error getting chunk size");
+        goto advance_and_error;
+    }
+
 	/* allocate space for the attribute descriptors */
 	if (nfields > 0)
 	{
@@ -560,6 +595,11 @@ getRowDescriptions(PGconn *conn, int msgLength)
 
 	/* result->binary is true only if ALL columns are binary */
 	result->binary = (nfields > 0) ? 1 : 0;
+
+    rsinfo.dict = malloc(sizeof(void *) * nfields);
+    rsinfo.dictLength = malloc(sizeof(void *) * nfields);
+    rsinfo.context = malloc(sizeof(void *) * nfields);
+    rsinfo.contextLength = malloc(sizeof(void *) * nfields);
 
 	/* get type info */
 	for (i = 0; i < nfields; i++)
@@ -608,7 +648,14 @@ getRowDescriptions(PGconn *conn, int msgLength)
 
 		if (format != 1)
 			result->binary = 0;
+
+        rsinfo.dict[i] = NULL;
+        rsinfo.dictLength[i] = NULL;
+        rsinfo.context[i] = NULL;
+        rsinfo.contextLength[i] = NULL;
 	}
+
+    rsinfo.result_buffer = malloc(CHUNK_SIZE);
 
 	/* Success! */
 	conn->result = result;
@@ -771,74 +818,116 @@ getAnotherTuple(PGconn *conn, int msgLength)
 	int			nfields = result->numAttributes;
 	const char *errmsg;
 	PGdataValue *rowbuf;
-	int			tupnfields;		/* # fields from tuple */
+	int			tupnfields;
+    int			rowCount;
 	int			vlen;			/* length of the current field value */
-	int			i;
 
-	/* Get the field count and make sure it's what we expect */
-	if (pqGetInt(&tupnfields, 2, conn))
-	{
-		/* We should not run out of data here, so complain */
-		errmsg = libpq_gettext("insufficient data in \"D\" message");
-		goto advance_and_error;
-	}
+    /* Get the field count and make sure it's what we expect */
+    if (pqGetInt(&rowCount, 4, conn))
+    {
+        /* We should not run out of data here, so complain */
+        errmsg = libpq_gettext("insufficient data in \"D\" message");
+        goto advance_and_error;
+    }
 
-	if (tupnfields != nfields)
-	{
-		errmsg = libpq_gettext("unexpected field count in \"D\" message");
-		goto advance_and_error;
-	}
+    // printf("Receiving %d rows\n", rowCount);
+    char **data_pointers = malloc(sizeof(char*) * nfields);
+    int **length_pointers = malloc(sizeof(int*) * nfields);
 
-	/* Resize row buffer if needed */
-	rowbuf = conn->rowBuf;
-	if (nfields > conn->rowBufLen)
-	{
-		rowbuf = (PGdataValue *) realloc(rowbuf,
-										 nfields * sizeof(PGdataValue));
-		if (!rowbuf)
-		{
-			errmsg = NULL;		/* means "out of memory", see below */
-			goto advance_and_error;
-		}
-		conn->rowBuf = rowbuf;
-		conn->rowBufLen = nfields;
-	}
+    char *buffer = rsinfo.result_buffer;
+    for (int i = 0; i < nfields; ++i) {
+        int len;
+        int compressed_length_data;
+        int compressed_length_lengths;
+        pqGetInt(&len, 4, conn);
+        pqGetInt(&compressed_length_data, 4, conn);
+        pqGetInt(&compressed_length_lengths, 4, conn);
 
-	/* Scan the fields */
-	for (i = 0; i < nfields; i++)
-	{
-		/* get the value length */
-		if (pqGetInt(&vlen, 4, conn))
-		{
-			/* We should not run out of data here, so complain */
-			errmsg = libpq_gettext("insufficient data in \"D\" message");
-			goto advance_and_error;
-		}
-		rowbuf[i].len = vlen;
+        size_t uncompressed_length_data = CHUNK_SIZE;
 
-		/*
-		 * rowbuf[i].value always points to the next address in the data
-		 * buffer even if the value is NULL.  This allows row processors to
-		 * estimate data sizes more easily.
-		 */
-		rowbuf[i].value = conn->inBuffer + conn->inCursor;
+#ifdef USE_ZSTD
+        if (!rsinfo.dict[i]) {
+            uncompressed_length_data = ZSTD_decompress(buffer, CHUNK_SIZE, conn->inBuffer + conn->inCursor, compressed_length_data);
+            rsinfo.dict[i] = ZSTD_createDDict(buffer, uncompressed_length_data);
+            rsinfo.context[i] = ZSTD_createDCtx();
+        } else {
+            uncompressed_length_data = ZSTD_decompress_usingDDict(rsinfo.context[i], buffer, CHUNK_SIZE, conn->inBuffer + conn->inCursor, compressed_length_data, rsinfo.dict[i]);
+        }
+#else
+        // printf("Snappy: Attribute %d, Compressed Length Data: %d, Compressed Length Lengths %d\n", i, compressed_length_data, compressed_length_lengths);
 
-		/* Skip over the data value */
-		if (vlen > 0)
-		{
-			if (pqSkipnchar(vlen, conn))
-			{
-				/* We should not run out of data here, so complain */
-				errmsg = libpq_gettext("insufficient data in \"D\" message");
-				goto advance_and_error;
-			}
-		}
-	}
+        snappy_status ret = SNAPPY_OK;
+        if ((ret = snappy_uncompress(conn->inBuffer + conn->inCursor, compressed_length_data, buffer, &uncompressed_length_data)) != SNAPPY_OK) {
+            printf("Error uncompressing data: %d\n", i);
+        } else {
+            // printf("Attribute %d: Data Uncompressing Success\n", i);
+        }
+#endif
+        data_pointers[i] = buffer;
+        buffer += uncompressed_length_data;
 
-	/* Process the collected row */
-	errmsg = NULL;
-	if (pqRowProcessor(conn, &errmsg))
-		return 0;				/* normal, successful exit */
+        pqSkipnchar(compressed_length_data, conn);
+
+        size_t uncompressed_length_lengths = CHUNK_SIZE;
+
+#ifdef USE_ZSTD
+        if (!rsinfo.dictLength[i]) {
+            uncompressed_length_lengths = ZSTD_decompress(buffer, CHUNK_SIZE, conn->inBuffer + conn->inCursor, compressed_length_lengths);
+            rsinfo.dictLength[i] = ZSTD_createDDict(buffer, uncompressed_length_lengths);
+            rsinfo.contextLength[i] = ZSTD_createDCtx();
+        } else {
+            uncompressed_length_lengths = ZSTD_decompress_usingDDict(rsinfo.contextLength[i], buffer, CHUNK_SIZE,
+                                                                  conn->inBuffer + conn->inCursor,
+                                                                     compressed_length_lengths, rsinfo.dictLength[i]);
+        }
+#else
+        if ((ret = snappy_uncompress(conn->inBuffer + conn->inCursor, compressed_length_lengths, buffer, &uncompressed_length_lengths)) != SNAPPY_OK) {
+            printf("Error uncompressing lengths %d\n", i);
+        } else {
+            // printf("Attribute %d: Length Uncompressing Success\n", i);
+        }
+#endif
+
+        pqSkipnchar(compressed_length_lengths, conn);
+        length_pointers[i] = buffer;
+        buffer += uncompressed_length_lengths;
+    }
+
+    bool isError = false;
+
+    for (int j = 0; j < rowCount; ++j) {
+        /* Resize row buffer if needed */
+        rowbuf = conn->rowBuf;
+        if (nfields > conn->rowBufLen)
+        {
+            rowbuf = (PGdataValue *) realloc(rowbuf,
+                                             nfields * sizeof(PGdataValue));
+            if (!rowbuf)
+            {
+                errmsg = NULL;		/* means "out of memory", see below */
+                goto advance_and_error;
+            }
+            conn->rowBuf = rowbuf;
+            conn->rowBufLen = nfields;
+        }
+
+        for (int i = 0; i < nfields; i++) {
+            int len = *length_pointers[i];
+            length_pointers[i] += 1;
+            rowbuf[i].len = len;
+
+            rowbuf[i].value = data_pointers[i];
+            data_pointers[i] += len;
+        }
+
+        errmsg = NULL;
+	    if (!pqRowProcessor(conn, &errmsg)) {
+            isError = true;
+            break;
+        }
+    }
+
+    if (!isError) return 0;
 
 	/* pqRowProcessor failed, fall through to report it */
 

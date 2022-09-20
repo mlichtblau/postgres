@@ -23,6 +23,9 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 
+#include <snappy-c.h>
+#include <zstd.h>
+#include <time.h>
 
 static void printtup_startup(DestReceiver *self, int operation,
 							 TupleDesc typeinfo);
@@ -151,6 +154,53 @@ printtup_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 */
 }
 
+static size_t CHUNK_SIZE = 10000000; // 1 Mb chunks
+
+typedef struct {
+    size_t maxsize;
+    char *buffer;
+    char *copy_buffer;
+    char *compression_buffer;
+    char **bitmask_pointers;
+    char **base_pointers;
+    char **data_pointers;
+    int **length_pointers;
+    bool *data_is_string;
+    bool *data_not_null;
+    size_t *attribute_lengths;
+    size_t transferred_count;
+    size_t tuples_per_chunk;
+    size_t total_tuples_send;
+    size_t total_tuples;
+    size_t count;
+    void **dict;
+    void **dictLength;
+    void **context;
+    void **contextLength;
+    size_t data_sent;
+    int compression_level;
+} ResultSetBuffer;
+
+static bool initialized = false;
+static ResultSetBuffer rsbuf;
+
+static int USE_COMPRESSION = true;
+static int MAX_COMPRESSED_LENGTH = 1000000;
+
+static long beginTime = 0;
+
+//#define PROTOCOL_NULLMASK
+#define USE_ZSTD
+
+/**
+ * Returns the current time in microseconds.
+ */
+long getMicrotime(){
+    struct timeval currentTime;
+    gettimeofday(&currentTime, NULL);
+    return currentTime.tv_sec * (int)1e6 + currentTime.tv_usec;
+}
+
 /*
  * SendRowDescriptionMessage --- send a RowDescription message to the frontend
  *
@@ -169,11 +219,111 @@ SendRowDescriptionMessage(StringInfo buf, TupleDesc typeinfo,
 	int			natts = typeinfo->natts;
 	int			i;
 	ListCell   *tlist_item = list_head(targetlist);
+    char       *baseptr;
+    size_t      rowsize;
+
+    beginTime = getMicrotime();
+    ereport(LOG, (errmsg("Setting Begin Time: %ld", beginTime)));
+
+    if (!initialized) {
+        char *clevel;
+        if (clevel = getenv("COMPRESSION_LEVEL")) {
+            rsbuf.compression_level = atoi(clevel);
+        } else {
+            rsbuf.compression_level = 0;
+        }
+        rsbuf.maxsize = CHUNK_SIZE;
+        rsbuf.buffer = malloc(CHUNK_SIZE);
+        rsbuf.copy_buffer = malloc(CHUNK_SIZE);
+#ifdef USE_ZSTD
+        MAX_COMPRESSED_LENGTH = ZSTD_compressBound(CHUNK_SIZE);
+#else
+        MAX_COMPRESSED_LENGTH = snappy_max_compressed_length(CHUNK_SIZE);
+#endif
+        rsbuf.compression_buffer = malloc(MAX_COMPRESSED_LENGTH);
+        initialized = true;
+        enlargeStringInfo(buf, MAX_COMPRESSED_LENGTH); // TODO: Room for optimization
+        // ereport(LOG, (errmsg("Finished Init Phase 1: %ld", getMicrotime() - beginTime)));
+    } else {
+        free(rsbuf.base_pointers);
+        free(rsbuf.data_pointers);
+        free(rsbuf.length_pointers);
+        free(rsbuf.data_is_string);
+        free(rsbuf.attribute_lengths);
+        free(rsbuf.data_not_null);
+        free(rsbuf.dict);
+        free(rsbuf.dictLength);
+        free(rsbuf.context);
+        free(rsbuf.contextLength);
+    }
+
+    rsbuf.transferred_count = 0;
+    rsbuf.tuples_per_chunk = 0;
+    rsbuf.total_tuples_send = 0;
+    rsbuf.total_tuples = 0; // FIXME
+    rsbuf.count = 0;
+    rsbuf.data_sent = 0;
+
+    rsbuf.base_pointers = malloc(sizeof(char*) * natts);
+    rsbuf.data_pointers = malloc(sizeof(char*) * natts);
+    rsbuf.length_pointers = malloc(sizeof(int*) * natts);
+    rsbuf.data_is_string = malloc(sizeof(bool) * natts);
+    rsbuf.attribute_lengths = malloc(sizeof(size_t) * natts);
+    rsbuf.data_not_null = malloc(sizeof(bool) * natts);
+    rsbuf.dict = malloc(sizeof(void *) * natts);
+    rsbuf.dictLength = malloc(sizeof(void *) * natts);
+    rsbuf.context = malloc(sizeof(void *) * natts);
+    rsbuf.contextLength = malloc(sizeof(void *) * natts);
+
+    rowsize = 0;
+
+    for (i = 0; i < natts; ++i) {
+        Form_pg_attribute att = TupleDescAttr(typeinfo, i);
+        char category;
+        bool preferred;
+        ssize_t attribute_length = att->attlen;
+        get_type_category_preferred(att->atttypid, &category, &preferred);
+        if ((rsbuf.data_is_string[i] = (category == 'S'))) {
+            attribute_length = att->atttypmod - 4 + 1; // null terminator
+        }
+        if (category == 'D') {
+            attribute_length = 4; // dates are stored as 4-byte integers
+        }
+        if (category == 'N' && attribute_length < 0) {
+            attribute_length = 64;
+        }
+        rsbuf.data_not_null[i] = att->attnotnull;
+        rsbuf.attribute_lengths[i] = attribute_length;
+        rowsize += attribute_length; //attribute length is given in bytes; convert to bits
+        Assert(attribute_length > 0); // FIXME: deal with Blobs
+    }
+
+    rsbuf.tuples_per_chunk = CHUNK_SIZE / (rowsize + (natts * sizeof (int)));
+    baseptr = rsbuf.buffer;
+
+    for (i = 0; i < natts; ++i) {
+        Form_pg_attribute att = TupleDescAttr(typeinfo, i);
+        rsbuf.base_pointers[i] = baseptr;
+        rsbuf.length_pointers[i] = rsbuf.base_pointers[i];
+        rsbuf.data_pointers[i] = rsbuf.base_pointers[i] + (rsbuf.tuples_per_chunk * sizeof(int));
+        baseptr += (rsbuf.tuples_per_chunk * (rsbuf.attribute_lengths[i] + sizeof (int)))/* + sizeof(int)*/;
+        rsbuf.dict[i] = NULL;
+        rsbuf.dictLength[i] = NULL;
+        rsbuf.context[i] = NULL;
+        rsbuf.contextLength[i] = NULL;
+    }
+
+    Assert(baseptr - rsbuf.buffer < CHUNK_SIZE);
+    Assert(rsbuf.tuples_per_chunk > 0);
 
 	/* tuple descriptor message type */
 	pq_beginmessage_reuse(buf, 'T');
 	/* # of attrs in tuples */
 	pq_sendint16(buf, natts);
+
+    // Compression Information
+    pq_sendint16(buf, USE_COMPRESSION);
+    pq_sendint32(buf, CHUNK_SIZE);
 
 	/*
 	 * Preallocate memory for the entire message to be sent. That allows to
@@ -307,6 +457,8 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	int			natts = typeinfo->natts;
 	int			i;
 
+    // ereport(LOG, (errmsg("Printtup")));
+
 	/* Set or update my derived attribute info, if needed */
 	if (myState->attrinfo != typeinfo || myState->nattrs != natts)
 		printtup_prepare_info(myState, typeinfo, natts);
@@ -317,65 +469,118 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	/* Switch into per-row context so we can recover memory below */
 	oldcontext = MemoryContextSwitchTo(myState->tmpcontext);
 
-	/*
-	 * Prepare a DataRow message (note buffer is in per-row context)
-	 */
-	pq_beginmessage_reuse(buf, 'D');
+    rsbuf.count++;
 
-	pq_sendint16(buf, natts);
+    for (i = 0; i < natts; i++) {
+        PrinttupAttrInfo *thisState = myState->myinfo + i;
+        Datum		attr = slot->tts_values[i];
 
-	/*
-	 * send the attributes of this tuple
-	 */
-	for (i = 0; i < natts; ++i)
-	{
-		PrinttupAttrInfo *thisState = myState->myinfo + i;
-		Datum		attr = slot->tts_values[i];
+        // ereport(LOG, (errmsg("Print Attr: %d", i)));
 
-		if (slot->tts_isnull[i])
-		{
-			pq_sendint32(buf, -1);
-			continue;
-		}
+        if (slot->tts_isnull[i])
+        {
+            *rsbuf.length_pointers[i] = -1;
+            rsbuf.length_pointers[i] += 1;
+            continue;
+        }
 
-		/*
-		 * Here we catch undefined bytes in datums that are returned to the
-		 * client without hitting disk; see comments at the related check in
-		 * PageAddItem().  This test is most useful for uncompressed,
-		 * non-external datums, but we're quite likely to see such here when
-		 * testing new C functions.
-		 */
-		if (thisState->typisvarlena)
-			VALGRIND_CHECK_MEM_IS_DEFINED(DatumGetPointer(attr),
-										  VARSIZE_ANY(attr));
+        if (thisState->format == 0)
+        {
+            char *outputstr;
+            outputstr = OutputFunctionCall(&thisState->finfo, attr);
+            int len = strlen(outputstr);
+            memcpy(rsbuf.data_pointers[i], outputstr, len);
+            rsbuf.data_pointers[i] += len;
 
-		if (thisState->format == 0)
-		{
-			/* Text output */
-			char	   *outputstr;
+            *rsbuf.length_pointers[i] = len;
+            rsbuf.length_pointers[i] += 1;
+        }
+        else
+        {
+            bytea *outputbytes;
+            outputbytes = SendFunctionCall(&thisState->finfo, attr);
+            int len = VARSIZE(outputbytes) - VARHDRSZ;
+            memcpy(rsbuf.data_pointers[i], VARDATA(outputbytes), len);
+            rsbuf.data_pointers[i] += len;
 
-			outputstr = OutputFunctionCall(&thisState->finfo, attr);
-			pq_sendcountedtext(buf, outputstr, strlen(outputstr), false);
-		}
-		else
-		{
-			/* Binary output */
-			bytea	   *outputbytes;
+            *rsbuf.length_pointers[i] = len;
+            rsbuf.length_pointers[i] += 1;
+        }
+    }
 
-			outputbytes = SendFunctionCall(&thisState->finfo, attr);
-			pq_sendint32(buf, VARSIZE(outputbytes) - VARHDRSZ);
-			pq_sendbytes(buf, VARDATA(outputbytes),
-						 VARSIZE(outputbytes) - VARHDRSZ);
-		}
-	}
+    if (rsbuf.count >= rsbuf.tuples_per_chunk || rsbuf.count % 3000 == 0 //) //1000000 || // always transfer on 1M or 10M total tuples: hacky workaround for not knowing when we reach the end
+        || rsbuf.total_tuples_send + rsbuf.count == 10000000 || rsbuf.total_tuples_send + rsbuf.count == 1000000)
+    {
 
-	pq_endmessage_reuse(buf);
+        pq_beginmessage_reuse(buf, 'D');
 
-	/* Return to caller's context, and flush row's temporary memory */
-	MemoryContextSwitchTo(oldcontext);
-	MemoryContextReset(myState->tmpcontext);
+        pq_sendint32(buf, rsbuf.count);
 
-	return true;
+
+        for (int i = 0; i < natts; ++i) {
+            int *length_start = rsbuf.base_pointers[i];
+            char *data_start = rsbuf.base_pointers[i] + (rsbuf.tuples_per_chunk * sizeof(int));
+            int len = rsbuf.data_pointers[i] - data_start;
+
+            size_t compressed_length_data = MAX_COMPRESSED_LENGTH;
+            size_t compressed_length_lengths = MAX_COMPRESSED_LENGTH;
+
+#ifdef USE_ZSTD
+            // ereport(LOG, (errmsg("ZSTD Compressing Attribute %d, Uncompressed Length: %d\n", i, len)));
+
+
+            if (!rsbuf.dict[i]) {
+                rsbuf.dict[i] = ZSTD_createCDict(data_start, len, rsbuf.compression_level);
+                rsbuf.dictLength[i] = ZSTD_createCDict(length_start, rsbuf.count * sizeof (int), rsbuf.compression_level);
+                rsbuf.context[i] = ZSTD_createCCtx();
+                rsbuf.contextLength[i] = ZSTD_createCCtx();
+                compressed_length_data = ZSTD_compress(rsbuf.compression_buffer, MAX_COMPRESSED_LENGTH, data_start, len, rsbuf.compression_level);
+                compressed_length_lengths = ZSTD_compress(rsbuf.compression_buffer + compressed_length_data, MAX_COMPRESSED_LENGTH, length_start, rsbuf.count * sizeof (int), rsbuf.compression_level);
+                // ereport(LOG, (errmsg("Created dicts: %ld", getMicrotime() - beginTime)));
+            } else {
+                compressed_length_data = ZSTD_compress_usingCDict(rsbuf.context[i], rsbuf.compression_buffer, MAX_COMPRESSED_LENGTH, data_start, len, rsbuf.dict[i]);
+                compressed_length_lengths = ZSTD_compress_usingCDict(rsbuf.contextLength[i], rsbuf.compression_buffer + compressed_length_data, MAX_COMPRESSED_LENGTH, length_start, rsbuf.count * sizeof (int), rsbuf.dictLength[i]);
+            }
+#else
+            // ereport(LOG, (errmsg("Snappy Compressing Attribute %d, Uncompressed Length: %d\n", i, len)));
+
+            ereport(LOG, (errmsg("Snappy blub")));
+
+            if (snappy_compress(data_start, len, rsbuf.compression_buffer, &compressed_length_data) != SNAPPY_OK) {
+                // Error
+                ereport(LOG, (errmsg("Failed to snappy compress data: %d", i)));
+            }
+
+            // ereport(LOG, (errmsg("Snappy Compressing Attribute %d, Compressed Length: %d\n", i, compressed_length_data)));
+
+            if (snappy_compress(length_start, rsbuf.count * sizeof (int), rsbuf.compression_buffer + compressed_length_data, &compressed_length_lengths) != SNAPPY_OK) {
+                // Error
+                ereport(LOG, (errmsg("Failed to snappy compress length: %d", i)));
+            }
+#endif
+
+            pq_sendint32(buf, len);
+            pq_sendint32(buf, compressed_length_data);
+            pq_sendint32(buf, compressed_length_lengths);
+            pq_sendbytes(buf, rsbuf.compression_buffer, compressed_length_data + compressed_length_lengths);
+        }
+
+        for (i = 0; i < natts; ++i) {
+            rsbuf.length_pointers[i] = rsbuf.base_pointers[i]/* + sizeof(int)*/;
+            rsbuf.data_pointers[i] = rsbuf.base_pointers[i] + (rsbuf.tuples_per_chunk * sizeof(int));
+        }
+
+        rsbuf.total_tuples_send += rsbuf.count;
+
+        rsbuf.count = 0;
+
+        pq_endmessage_reuse(buf);
+    }
+
+    MemoryContextSwitchTo(oldcontext);
+    MemoryContextReset(myState->tmpcontext);
+
+    return true;
 }
 
 /* ----------------
